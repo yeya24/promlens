@@ -14,7 +14,9 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/url"
 	"os"
@@ -22,14 +24,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
-	"github.com/pkg/errors"
-	"github.com/prometheus/common/promlog"
-	promlogflag "github.com/prometheus/common/promlog/flag"
+	"github.com/alecthomas/kingpin/v2"
+	"github.com/prometheus/common/promslog"
+	promslogflag "github.com/prometheus/common/promslog/flag"
 	"github.com/prometheus/common/version"
 	"github.com/prometheus/exporter-toolkit/web/kingpinflag"
-	"gopkg.in/alecthomas/kingpin.v2"
 
 	"github.com/prometheus/promlens/pkg/grafana"
 	"github.com/prometheus/promlens/pkg/sharer"
@@ -79,7 +78,7 @@ func computeExternalURL(u string, listenAddrs []string) (*url.URL, error) {
 	return eu, nil
 }
 
-func getLinkSharer(logger log.Logger, gcsBucket string, sqlDriver string, sqlDSN string, createTables bool, sqlRetention time.Duration) (sharer.Sharer, error) {
+func getLinkSharer(logger *slog.Logger, gcsBucket string, sqlDriver string, sqlDSN string, createTables bool, sqlRetention time.Duration) (sharer.Sharer, error) {
 	if sqlDSN == "" && gcsBucket == "" {
 		return nil, nil
 	}
@@ -90,17 +89,17 @@ func getLinkSharer(logger log.Logger, gcsBucket string, sqlDriver string, sqlDSN
 
 	if sqlDriver == "sqlite3" {
 		sqlDriver = "sqlite"
-		level.Warn(logger).Log("msg", "The 'sqlite3' driver is deprecated, using 'sqlite' as a replacement.")
+		logger.Warn("The 'sqlite3' driver is deprecated, using 'sqlite' as a replacement.")
 	}
 
 	if sqlDSN != "" {
 		if sqlDriver != "mysql" && sqlDriver != "sqlite" && sqlDriver != "postgres" {
-			return nil, errors.Errorf("unsupported SQL driver %q, supported values are 'mysql', 'postgres' and 'sqlite'", sqlDriver)
+			return nil, fmt.Errorf("unsupported SQL driver %q, supported values are 'mysql', 'postgres' and 'sqlite'", sqlDriver)
 		}
 
 		s, err := sharer.NewSQLSharer(logger, sqlDriver, sqlDSN, createTables, sqlRetention)
 		if err != nil {
-			return nil, errors.Wrap(err, "error creating SQL link sharer")
+			return nil, fmt.Errorf("error creating SQL link sharer: %w", err)
 		}
 
 		return s, nil
@@ -108,7 +107,7 @@ func getLinkSharer(logger log.Logger, gcsBucket string, sqlDriver string, sqlDSN
 
 	s, err := sharer.NewGCSSharer(gcsBucket)
 	if err != nil {
-		return nil, errors.Wrap(err, "error creating GCS link sharer")
+		return nil, fmt.Errorf("error creating GCS link sharer: %w", err)
 	}
 	return s, nil
 }
@@ -129,7 +128,7 @@ func getGrafanaBackend(url string, token string, tokenFile string) (*grafana.Bac
 	if tokenFile != "" {
 		tokenBuf, err := os.ReadFile(tokenFile)
 		if err != nil {
-			return nil, errors.Wrapf(err, "error reading Grafana API token file %q", tokenFile)
+			return nil, fmt.Errorf("error reading Grafana API token file %q: %w", tokenFile, err)
 		}
 		token = strings.TrimSpace(string(tokenBuf))
 	}
@@ -162,23 +161,23 @@ func main() {
 
 	defaultPrometheusURL := app.Flag("web.default-prometheus-url", "The default Prometheus URL to load PromLens with.").Default("").String()
 
-	var logCfg promlog.Config
-	promlogflag.AddFlags(app, &logCfg)
+	var logCfg promslog.Config
+	promslogflag.AddFlags(app, &logCfg)
 
 	toolkitConfig := kingpinflag.AddFlags(app, ":8080")
 
 	_, err := app.Parse(os.Args[1:])
 	if err != nil {
-		fmt.Fprintln(os.Stderr, errors.Wrapf(err, "error parsing commandline arguments"))
+		fmt.Fprintln(os.Stderr, fmt.Errorf("error parsing commandline arguments: %w", err))
 		app.Usage(os.Args[1:])
 		os.Exit(2)
 	}
 
-	logger := promlog.New(&logCfg)
+	logger := promslog.New(&logCfg)
 
 	externalURL, err := computeExternalURL(*promlensURL, *toolkitConfig.WebListenAddresses)
 	if err != nil {
-		level.Error(logger).Log("msg", "Error parsing external URL.", "err", err, "url", *promlensURL)
+		logger.Error("Error parsing external URL.", "err", err, "url", *promlensURL)
 		os.Exit(2)
 	}
 
@@ -195,28 +194,28 @@ func main() {
 	}
 	shr, err := getLinkSharer(logger, *sharedLinksGCSBucket, *sharedLinksSQLDriver, *sharedLinksSQLDSN, *createSharedLinksTables, *sharedLinksRetention)
 	if err != nil {
-		level.Error(logger).Log("msg", "Error initializing link sharer.", "err", err)
+		logger.Error("Error initializing link sharer.", "err", err)
 		os.Exit(2)
 	}
 	if shr == nil {
-		level.Info(logger).Log("msg", "No link sharing backends are enabled - disabling link sharing functionality.")
+		logger.Info("No link sharing backends are enabled - disabling link sharing functionality.")
 	} else {
 		defer func() {
-			level.Info(logger).Log("msg", "Closing link sharer.")
+			logger.Info("Closing link sharer.")
 			shr.Close()
 		}()
 	}
 
 	gb, err := getGrafanaBackend(*grafanaURL, *grafanaToken, *grafanaTokenFile)
 	if err != nil {
-		level.Error(logger).Log("msg", "Error initializing Grafana backend.", "err", err)
+		logger.Error("Error initializing Grafana backend.", "err", err)
 		os.Exit(2)
 	}
 	if gb == nil {
-		level.Info(logger).Log("msg", "No Grafana backend enabled - disabling Grafana datasource integration.")
+		logger.Info("No Grafana backend enabled - disabling Grafana datasource integration.")
 	}
 
-	level.Error(logger).Log("msg", "Running HTTP server failed.", "err", web.Serve(&web.Config{
+	logger.Error("Running HTTP server failed.", "err", web.Serve(&web.Config{
 		Logger:                     logger,
 		ToolkitConfig:              toolkitConfig,
 		RoutePrefix:                *routePrefix,
